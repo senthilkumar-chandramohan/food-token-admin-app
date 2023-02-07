@@ -1,61 +1,62 @@
-import ethers from 'ethers';
-import { SYSTEM_ACCOUNT, SYSTEM_ACCOUNT_PRIVATE_KEY, USER_ACCOUNT_DETAILS_MAP, CONTRACT_JSON } from "../utils/constants.js";
-import { getWeb3Instance, createCryptoAccount } from "../utils/w3.js";
+import ethers from "ethers";
+import crypto from "crypto";
+import dotenv from "dotenv";
+import { splitSignature } from "ethers/lib/utils.js";
+import { EXTERNAL_ACCOUNT_ID_WALLET_MAP, CONTRACT_ADDRESS, CONTRACT_ABI } from "../utils/constants.js";
+import { getWeb3Instance } from "../utils/w3.js";
 
-const _storeAccountInVault = (accountId, address, privateKey) => {
-    USER_ACCOUNT_DETAILS_MAP[accountId] = {
-        address,
-        privateKey,
-    };
+dotenv.config();
+
+const _storeWalletInVault = (externalAccountId, wallet) => {
+    EXTERNAL_ACCOUNT_ID_WALLET_MAP[externalAccountId] = wallet;
+    console.log(EXTERNAL_ACCOUNT_ID_WALLET_MAP);
 };
 
-const createAccountProfile = (accountId) => {
-    const account = createCryptoAccount();
+const createWallet = () => {
+    const id = crypto.randomBytes(32).toString('hex');
+    const privateKey = "0x" + id;
+
+    const wallet = new ethers.Wallet(privateKey);
+    return { privateKey, wallet };
+};
+
+const createAccountProfile = async (externalAccountId) => {
+    const signer = new ethers.Wallet(process.env.SIGNER_PRIVATE_KEY);
+    const { privateKey, wallet } = createWallet();
     const {
         address,
-        privateKey,
-    } = account;
+    } = wallet;
 
-    _storeAccountInVault(accountId, address, privateKey);
-    _provideTransferPermissionToSystemAccount(account);
-    return account;
+    _storeWalletInVault(externalAccountId, { privateKey, address });
+    _provideTransferPermissionToSystemAccount(wallet, signer);
+    return wallet;
 };
 
-const _provideTransferPermissionToSystemAccount = async (account) => {
-    const owner = account.address;
-    const spender = SYSTEM_ACCOUNT;
+const _provideTransferPermissionToSystemAccount = async (wallet, signer) => {
+    const ownerAddress = wallet.address;
+    const spenderAddress = signer.address;
     const value = ethers.constants.MaxUint256; // Unlimited balance
     const nonce = 0; // Since Permit is executed only once for a wallet
     const deadline = ethers.constants.MaxUint256; // Unlimited timeframe
 
     const web3 = getWeb3Instance();
-    const networkId = await web3.eth.net.getId();
-    const {
-        contractName,
-        abi,
-        networks,
-        devdoc: {
-            version,
-        },
-    } = CONTRACT_JSON;
 
-    const contractAddress = networks[networkId].address;
-    const permit = await _createPermit(
-        spender,
-        value,
+    const abi = CONTRACT_ABI;
+    const chainId = 5 // For Goerli
+    const name = "FoodToken";
+    const version = "1";
+
+    const permitConfig = {
         nonce,
-        deadline,
-        account, 
-        {
-            networkId,
-            domainName: contractName,
-            domainVersion: version,
-            contractAddress,
-        }
-    );
+        name,
+        version,
+        chainId,
+    };
 
-    // console.log(permit);
-    const { v, r, s } = permit;
+    const contractAddress = CONTRACT_ADDRESS;
+    const permitSignature = await getPermitSignature(wallet, spenderAddress, value, deadline, contractAddress, permitConfig);
+
+    const { v, r, s } = permitSignature;
 
     // Call Permit method in contract
     const contract = new web3.eth.Contract(
@@ -63,16 +64,11 @@ const _provideTransferPermissionToSystemAccount = async (account) => {
         contractAddress,
     );
 
-    const txn = contract.methods.permit(owner, spender, value, deadline, v, r, s);
-    // TODO: update contract to accept sender const txn = contract.methods.sendCoin(sender, receiver, amount);
-    const gas = await txn.estimateGas({ from: SYSTEM_ACCOUNT });
+    const txn = contract.methods.permit(ownerAddress, spenderAddress, value, deadline, v, r, s);
+    const gas = await txn.estimateGas({ from: signer.address });
     const gasPrice = await web3.eth.getGasPrice();
     const data = txn.encodeABI();
-    const accountNonce = await web3.eth.getTransactionCount(SYSTEM_ACCOUNT);
-
-    console.log('\n gas:', gas);
-    console.log('\n gasPrice:', gasPrice);
-    console.log('\n nonce:', accountNonce);
+    const accountNonce = await web3.eth.getTransactionCount(signer.address);
 
     const signedTxn = await web3.eth.accounts.signTransaction({
         to: contract.options.address,
@@ -80,56 +76,71 @@ const _provideTransferPermissionToSystemAccount = async (account) => {
         gas,
         gasPrice,
         nonce: accountNonce,
-        chainId: networkId,
-    }, SYSTEM_ACCOUNT_PRIVATE_KEY);
+        chainId,
+    }, process.env.SIGNER_PRIVATE_KEY);
 
     const receipt = await web3.eth.sendSignedTransaction(signedTxn.rawTransaction);
-    return receipt;
-};
+    console.log(receipt);
+    return wallet;
+}
 
-const _createPermit = async (spender, value, nonce, deadline, account, { networkId, domainName, domainVersion, contractAddress }) => {
+const getPermitSignature = async (
+    wallet,
+    spender,
+    value,
+    deadline,
+    contractAddress,
+    permitConfig,
+  ) => {
     const {
-        address,
-        privateKey,
-        sign,
-    } = account;
-
-    const permit = { owner: address, spender, value, nonce, deadline }
-    const Permit = [
-      { name: "owner", type: "address" },
-      { name: "spender", type: "address" },
-      { name: "value", type: "uint256" },
-      { name: "nonce", type: "uint256" },
-      { name: "deadline", type: "uint256" },
-    ];
-
-    const domain = {
-      name: domainName,
-      version: domainVersion,
-      verifyingContract: contractAddress,
-      chainId: networkId,
-    };
-
-    const domainType = [
-      { name: "name", type: "string" },
-      { name: "version", type: "string" },
-      { name: "chainId", type: "uint256" },
-      { name: "verifyingContract", type: "address" },
-    ];
-
-    const dataToSign = JSON.stringify({
-        types: {
-            EIP712Domain: domainType,
-            Permit: Permit
+        nonce,
+        name,
+        version,
+        chainId
+    } = permitConfig;
+  
+    return splitSignature (
+      await wallet._signTypedData(
+        {
+          name,
+          version,
+          chainId,
+          verifyingContract: contractAddress,
         },
-        domain: domain,
-        primaryType: "Permit",
-        message: permit
-    });
-
-    return sign(dataToSign, privateKey);
-};
-
+        {
+          Permit: [
+            {
+              name: 'owner',
+              type: 'address',
+            },
+            {
+              name: 'spender',
+              type: 'address',
+            },
+            {
+              name: 'value',
+              type: 'uint256',
+            },
+            {
+              name: 'nonce',
+              type: 'uint256',
+            },
+            {
+              name: 'deadline',
+              type: 'uint256',
+            },
+          ],
+        },
+        {
+          owner: wallet.address,
+          spender,
+          value,
+          nonce,
+          deadline,
+        }
+      )
+    );
+  }
 
 export {
     createAccountProfile,

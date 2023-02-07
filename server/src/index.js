@@ -22,12 +22,12 @@ app.use(cors({
     origin: ['https://localhost:4000','https://192.168.0.112:4000']
 }));
 
-app.get("/create-acount-profile", (req, res) => {
-    const account = createAccountProfile("9962589489");
+app.get("/create-acount-profile", async (req, res) => {
+    const wallet = await createAccountProfile("9962589489");
 
     res.json({
         status: "Account created successfully",
-        account,
+        wallet,
     });
 });
 
